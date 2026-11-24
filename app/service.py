@@ -101,20 +101,22 @@ def _validate_incoming(
             )
         seen_st.setdefault(key, msg_no)
 
-    # 与现行有效消息冲突（active=1；软删消息行保留但不参与）
+    # 与现行有效消息冲突（active=1；失效消息行保留但不参与）
     for msg_no, c in by_msg.items():
         row = conn.execute(
-            "SELECT ship_no, ts, lon, lat, content_sha FROM message "
-            "WHERE msg_no=? AND active=1",
+            "SELECT content_sha, active FROM message WHERE msg_no=?",
             (msg_no,),
         ).fetchone()
-        if row is not None:
-            if row["content_sha"] != _content_sha(
-                c["ship_no"], c["ts"], c["lon"], c["lat"]
-            ):
-                raise ValidationError(
-                    f"同号异值：消息号 {msg_no!r} 与现行有效批次内容冲突，整批退回"
-                )
+        if (
+            row is not None
+            and row["active"]
+            and row["content_sha"]
+            != _content_sha(c["ship_no"], c["ts"], c["lon"], c["lat"])
+        ):
+            raise ValidationError(
+                f"同号异值：消息号 {msg_no!r} 与现行有效批次内容冲突，整批退回"
+            )
+        # 失效消息号可按本次船号/时刻/经纬度重新补报，不与旧内容比较
         clash = conn.execute(
             "SELECT msg_no FROM message WHERE ship_no=? AND ts=? AND msg_no<>? "
             "AND active=1",
@@ -173,9 +175,13 @@ def apply_batch(
     #    改动点 = 新纳入的消息（首次出现）或换交中被删除的消息；
     #    已由其他批次提供、本批只是重复提供的同内容消息不算改动点。
     newly_inserted: set[str] = set()
+    # 同号重新补报且内容变化：旧点从旧船/旧时刻消失，须作为删除标记参与
+    # 增量触及判定，避免旧港内段被整体沿用而保留失效的邻点。
+    retired_old: list[dict[str, Any]] = []
     for msg_no, c in by_msg.items():
         row = conn.execute(
-            "SELECT active FROM message WHERE msg_no=?", (msg_no,)
+            "SELECT ship_no, ts, lon, lat, content_sha, active FROM message WHERE msg_no=?",
+            (msg_no,),
         ).fetchone()
         if row is None:
             conn.execute(
@@ -193,11 +199,30 @@ def apply_batch(
             )
             newly_inserted.add(msg_no)
         elif row["active"] == 0:
-            # 历史上被软删、同号同内容重新纳入 -> 重新生效，属于改动点
+            # 历史上被软删的消息重新纳入：按本次补报的新内容覆盖入仓，
+            # 不能沿用被撤下时的旧点。重新生效属于改动点。
             conn.execute(
-                "UPDATE message SET active=1 WHERE msg_no=?", (msg_no,)
+                "UPDATE message SET ship_no=?, ts=?, lon=?, lat=?, content_sha=?, "
+                "active=1 WHERE msg_no=?",
+                (
+                    c["ship_no"],
+                    c["ts"],
+                    c["lon"],
+                    c["lat"],
+                    _content_sha(c["ship_no"], c["ts"], c["lon"], c["lat"]),
+                    msg_no,
+                ),
             )
             newly_inserted.add(msg_no)
+            if row["content_sha"] != _content_sha(
+                c["ship_no"], c["ts"], c["lon"], c["lat"]
+            ):
+                # 内容与撤下时不同：旧内容不作为新消息入仓，但仍需触发旧船重算
+                retired_old.append(
+                    {"msg_no": msg_no, "ship_no": row["ship_no"], "ts": row["ts"],
+                     "lon": row["lon"], "lat": row["lat"]}
+                )
+                affected_ships.add(row["ship_no"])
         conn.execute(
             "INSERT OR IGNORE INTO message_source(msg_no, batch_no) VALUES(?,?)",
             (msg_no, batch_no),
@@ -291,10 +316,12 @@ def apply_batch(
 
     # 仅真正失效的消息作为删除标记；其他批次仍提供的消息不产生任何变化。
     # 删除标记不参与实际判定（判定只基于现存点），仅用于增量沿用的触及判断。
-    removed_by_ship: dict[str, list[sqlite3.Row]] = {}
+    removed_by_ship: dict[str, list[dict[str, Any]]] = {}
     for r in removed_rows:
         if r["msg_no"] in deleted_msg_nos:
-            removed_by_ship.setdefault(r["ship_no"], []).append(r)
+            removed_by_ship.setdefault(r["ship_no"], []).append(dict(r))
+    for r in retired_old:
+        removed_by_ship.setdefault(r["ship_no"], []).append(r)
 
     for ship_no in sorted(affected_ships):
         points: list[Point] = []
@@ -482,41 +509,64 @@ def resolve_version(
     ).fetchone()
 
 
-def _enrich_point(conn: sqlite3.Connection, raw: Optional[str]) -> Optional[dict]:
+def _enrich_point(
+    conn: sqlite3.Connection, raw: Optional[str], ship_no: str
+) -> Optional[dict]:
+    """点位按版本内原值返回，来源只列当前仍提供同号同内容的批次。
+
+    消息已失效（无有效批次提供）或已被同名消息号以不同内容重新补报时，
+    历史版本的点仍按原值可查，但来源为空数组。
+    """
     if raw is None:
         return None
     point = json.loads(raw)
-    batches = [
-        r["batch_no"]
-        for r in conn.execute(
-            "SELECT batch_no FROM message_source WHERE msg_no=? ORDER BY batch_no",
-            (point["msg_no"],),
-        )
-    ]
+    current = conn.execute(
+        "SELECT ship_no, ts, lon, lat, active FROM message WHERE msg_no=?",
+        (point["msg_no"],),
+    ).fetchone()
+    same_content = (
+        current is not None
+        and current["active"] == 1
+        and current["ship_no"] == ship_no
+        and current["ts"] == point["ts"]
+        and current["lon"] == point["lon"]
+        and current["lat"] == point["lat"]
+    )
+    if same_content:
+        batches = [
+            r["batch_no"]
+            for r in conn.execute(
+                "SELECT batch_no FROM message_source WHERE msg_no=? ORDER BY batch_no",
+                (point["msg_no"],),
+            )
+        ]
+    else:
+        batches = []
     point["source_batches"] = batches
     return point
 
 
 def _row_to_record(conn: sqlite3.Connection, row: sqlite3.Row, kind: str) -> dict:
+    ship_no = row["ship_no"]
     base = {
-        "ship_no": row["ship_no"],
+        "ship_no": ship_no,
         "seg_no": row["seg_no"],
         "run_no": row["run_no"],
         "seg_key": row["seg_key"],
-        "entry_point": _enrich_point(conn, row["entry_point"]),
-        "exit_point": _enrich_point(conn, row["exit_point"]),
+        "entry_point": _enrich_point(conn, row["entry_point"], ship_no),
+        "exit_point": _enrich_point(conn, row["exit_point"], ship_no),
     }
     if kind == "stop":
         base.update(
             kind="stop",
-            before_point=_enrich_point(conn, row["before_point"]),
-            after_point=_enrich_point(conn, row["after_point"]),
+            before_point=_enrich_point(conn, row["before_point"], ship_no),
+            after_point=_enrich_point(conn, row["after_point"], ship_no),
         )
     else:
         base.update(
             kind="pending",
-            before_point=_enrich_point(conn, row["before_point"]),
-            after_point=_enrich_point(conn, row["after_point"]),
+            before_point=_enrich_point(conn, row["before_point"], ship_no),
+            after_point=_enrich_point(conn, row["after_point"], ship_no),
             reason=row["reason"],
         )
     return base
@@ -524,10 +574,15 @@ def _row_to_record(conn: sqlite3.Connection, row: sqlite3.Row, kind: str) -> dic
 
 def query_records(
     conn: sqlite3.Connection, ship_no: str, kind: str, version_id: Optional[int]
-) -> list[dict]:
+) -> Optional[list[dict]]:
+    """在调用方的只读快照内装配记录：版本、记录与各点来源取自同一份数据。
+
+    指定版本不存在时返回 None，由路由层转为 404。
+    """
     version = resolve_version(conn, version_id)
     if version is None:
-        return []
+        # 显式指定了不存在的版本 -> 404；尚无任何版本时现行结果为空
+        return None if version_id is not None else []
     table = "stop_record" if kind == "stop" else "pending_record"
     rows = conn.execute(
         f"SELECT * FROM {table} WHERE version_id=? AND ship_no=? "

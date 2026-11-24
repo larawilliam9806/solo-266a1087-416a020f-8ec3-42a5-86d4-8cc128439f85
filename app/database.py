@@ -124,3 +124,18 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.execute("COMMIT")
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """只读快照：一次查询内的版本、记录与来源取自同一份已提交数据。
+
+    WAL 模式下读事务不阻塞写事务，核算期间旧结果仍可查询；事务内即使有
+    并发提交，后续 SELECT 也始终看到开启事务时的同一快照。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")

@@ -7,6 +7,8 @@ import tempfile
 import pytest
 from fastapi.testclient import TestClient
 
+from app import service
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
@@ -303,7 +305,226 @@ def test_old_version_still_queryable_after_recompute(client):
     assert client.get("/ships/S1/stops?version_id=9999").status_code == 404
 
 
-# ---------------------------------------------------------------- 增量沿用
+# ---------------------------------------------------------------- 失效后同号补报
+
+def test_rejudge_retired_msg_no_with_fresh_content(client):
+    """最后来源被换交撤下后，同号补报须按本次船号/时刻/经纬度入仓。"""
+    # B1 的 i1 使 S1 构成停靠
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+    )
+    # 换交撤下 i1（再无批次提供）-> 消息失效
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+        mode="replace",
+    )
+    assert client.get("/ships/S1/stops").json() == []
+
+    # 用同一消息号补报完全不同的船、时刻与经纬度（港外单点）
+    r = submit(client, "B2", [m("i1", "S2", "2026-11-24T09:00:00Z", 120.5, 30.5)])
+    assert r.status_code == 200, r.text
+    # 新点是港外单点：不产生停靠/待补；旧停靠也不得借旧点复活
+    assert client.get("/ships/S1/stops").json() == []
+    assert client.get("/ships/S2/stops").json() == []
+    assert client.get("/ships/S2/pending").json() == []
+    info = client.get("/batches/B2").json()
+    assert info["message_count"] == 1
+
+
+def test_retired_msg_no_same_content_moves_point_to_new_ts(client):
+    """同号补报同内容但换个时刻：入仓点按本次时刻参与判定。"""
+    submit(
+        client,
+        "B1",
+        [
+            m("x1", "S1", B.format(0), 121.5, 31.5),
+            m("k1", "S9", B.format(0), 120.0, 30.0),
+        ],
+    )
+    submit(client, "B1", [m("k1", "S9", B.format(0), 120.0, 30.0)], mode="replace")
+    assert len(client.get("/ships/S1/pending").json()) == 0  # x1 已失效
+
+    # 补报同内容（船/经纬度不变），时刻变为 09:00
+    submit(client, "B2", [m("x1", "S1", "2026-11-24T09:00:00Z", 121.5, 31.5)])
+    pending = client.get("/ships/S1/pending").json()
+    assert len(pending) == 1
+    assert pending[0]["entry_point"]["ts"] == "2026-11-24T09:00:00Z"
+    assert pending[0]["entry_point"]["source_batches"] == ["B2"]
+
+
+def test_retired_msg_no_same_content_same_ts_reuses_record(client):
+    """同号同内容重新补报：点位按入仓值重新生效。"""
+    submit(client, "B1", [m("x1", "S1", B.format(0), 121.5, 31.5)])
+    # 换交以另一条消息顶替，撤下 x1
+    submit(client, "B1", [m("k1", "S9", B.format(0), 120.0, 30.0)], mode="replace")
+    assert client.get("/ships/S1/pending").json() == []
+
+    submit(client, "B2", [m("x1", "S1", B.format(0), 121.5, 31.5)])
+    pending = client.get("/ships/S1/pending").json()
+    assert len(pending) == 1
+    assert pending[0]["entry_point"]["ts"] == B.format(0)
+    assert pending[0]["entry_point"]["source_batches"] == ["B2"]
+
+
+def test_retired_msg_no_new_ship_and_time_uses_batch_ship(client):
+    """补报已失效号码时按本次船号入仓，而非旧船。"""
+    submit(client, "B1", [m("x1", "S1", B.format(0), 121.5, 31.5)])
+    submit(client, "B1", [m("k1", "S9", B.format(0), 120.0, 30.0)], mode="replace")
+
+    submit(client, "B2", [m("x1", "S2", "2026-11-24T09:00:00Z", 121.5, 31.5)])
+    assert client.get("/ships/S1/pending").json() == []
+    pending = client.get("/ships/S2/pending").json()
+    assert len(pending) == 1
+    assert pending[0]["entry_point"]["ts"] == "2026-11-24T09:00:00Z"
+    assert pending[0]["entry_point"]["source_batches"] == ["B2"]
+
+
+def test_retired_msg_no_reposted_to_other_ship_recomputes_old_ship(client):
+    """失效号码换船补报：旧船记录不得整体沿用（旧停靠须消失）。"""
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+    )
+    assert len(client.get("/ships/S1/stops").json()) == 1
+    # 换交撤下 i1 -> S1 不再停靠
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+        mode="replace",
+    )
+    assert client.get("/ships/S1/stops").json() == []
+
+    # i1 以另一条船、另一个时刻/位置补报
+    submit(client, "B2", [m("i1", "S2", "2026-11-24T09:00:00Z", 121.5, 31.5)])
+    assert client.get("/ships/S1/stops").json() == []
+    assert client.get("/ships/S1/pending").json() == []
+    assert len(client.get("/ships/S2/pending").json()) == 1
+
+
+def test_retired_msg_no_reappearing_in_replace_only_uses_new_content(client):
+    """换交同号提供与现行一致内容，不得在删除旧来源后又被置为失效。"""
+    submit(client, "B1", [m("x1", "S1", B.format(0), 121.5, 31.5)])
+    r = submit(
+        client, "B1", [m("x1", "S1", B.format(0), 121.5, 31.5)],
+        mode="replace",
+    )
+    assert r.status_code == 200, r.text
+    pending = client.get("/ships/S1/pending").json()
+    assert len(pending) == 1
+    assert pending[0]["entry_point"]["msg_no"] == "x1"
+    assert pending[0]["entry_point"]["source_batches"] == ["B1"]
+
+
+def test_old_version_point_keeps_original_values_sources_only_same_content(client):
+    """历史版本点位按该版原值返回；来源只列仍提供同号同内容的批次。"""
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+    )
+    v1 = client.get("/versions").json()[-1]["version_id"]
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+        mode="replace",
+    )
+    # 同号异值补报 i1（旧消息已失效，允许）
+    submit(client, "B2", [m("i1", "S1", "2026-11-24T09:00:00Z", 121.9, 31.9)])
+
+    old = client.get(f"/ships/S1/stops?version_id={v1}").json()
+    assert len(old) == 1
+    assert old[0]["entry_point"]["msg_no"] == "i1"
+    assert old[0]["entry_point"]["ts"] == "2026-11-24T08:05:00Z"
+    assert old[0]["entry_point"]["lon"] == 121.5
+    assert old[0]["entry_point"]["lat"] == 31.5
+    assert old[0]["entry_point"]["source_batches"] == []  # 新内容不被列为旧来源
+    # 其他仍有效的点来源正常
+    assert old[0]["before_point"]["source_batches"] == ["B1"]
+
+
+def test_reposting_retired_msg_no_conflicts_with_live_messages(client):
+    """失效号码补报与仍有效消息同号异值/同船同刻异号时整批退回。"""
+    submit(client, "B1", [m("x1", "S1", B.format(0), 121.5, 31.5)])
+    submit(client, "B1", [m("k1", "S9", B.format(0), 120.0, 30.0)], mode="replace")
+    submit(client, "B2", [m("y1", "S1", B.format(10), 121.5, 31.5)])
+    v_before = client.get("/versions").json()
+
+    # 同船同刻异号：x1 补报为与 y1 同船同刻
+    r = submit(client, "B3", [m("x1", "S1", B.format(10), 121.6, 31.6)])
+    assert r.status_code == 409 and "同船同刻异号" in r.json()["detail"]
+    assert client.get("/versions").json() == v_before
+    assert client.get("/batches/B3").status_code == 404
+
+    # 同号异值：x1 与仍有效的 z1 冲突
+    submit(client, "B4", [m("z1", "S2", B.format(0), 120.0, 30.0)])
+    v_before = client.get("/versions").json()
+    r2 = submit(client, "B5", [m("z1", "S2", B.format(0), 120.9, 30.9)])
+    assert r2.status_code == 409 and "同号异值" in r2.json()["detail"]
+    assert client.get("/versions").json() == v_before
+    assert client.get("/batches/B5").status_code == 404
+
+
+def test_query_is_consistent_snapshot(client, monkeypatch):
+    """一次查询中的记录与各点来源须取自同一份已提交数据。"""
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+    )
+    calls = []
+    real_enrich = service._enrich_point
+
+    def racing_enrich(conn, raw, ship_no):
+        # 首次装配来源时，另一个已提交版本把 o2 撤销并补报新内容
+        if not calls:
+            calls.append(1)
+            submit(client, "B1", [m("i1", "S1", B.format(5), 121.5, 31.5)],
+                   mode="replace")
+        return real_enrich(conn, raw, ship_no)
+
+    monkeypatch.setattr(service, "_enrich_point", racing_enrich)
+    stops = client.get("/ships/S1/stops").json()
+    assert len(stops) == 1
+    # 若来源与记录不在同一快照，快照后的提交会让 o1/o2 来源为空
+    assert stops[0]["before_point"]["source_batches"] == ["B1"]
+    assert stops[0]["after_point"]["source_batches"] == ["B1"]
+    assert stops[0]["entry_point"]["msg_no"] == "i1"
+
+    # 查询之外的后续请求看到新版本：记录与来源同步变化
+    assert client.get("/ships/S1/stops").json() == []
+
 
 def test_segment_reuse_when_changes_separated_by_unchanged_outside(client):
     # 第一段 08:00-08:10 构成停靠；新增点在 10:00，间隔 >30 分钟形成另一段

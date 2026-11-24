@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from .config import get_port_rect
-from .database import connect, init_db, transaction
+from .database import connect, init_db, read_snapshot, transaction
 from .engine import ValidationError
 from .models import (
     BatchInfo,
@@ -113,9 +113,11 @@ def get_stops(
     version_id: Optional[int] = Query(None, description="缺省查现行版本，可指定历史版本"),
     conn=Depends(get_conn),
 ) -> list[StopRecordOut]:
-    if version_id is not None and service.resolve_version(conn, version_id) is None:
+    with read_snapshot(conn):
+        records = service.query_records(conn, ship_no, "stop", version_id)
+    if records is None:
         raise HTTPException(status_code=404, detail="结果版本不存在")
-    return service.query_records(conn, ship_no, "stop", version_id)
+    return records
 
 
 @app.get("/ships/{ship_no}/pending", response_model=list[PendingRecordOut])
@@ -124,9 +126,11 @@ def get_pending(
     version_id: Optional[int] = Query(None, description="缺省查现行版本，可指定历史版本"),
     conn=Depends(get_conn),
 ) -> list[PendingRecordOut]:
-    if version_id is not None and service.resolve_version(conn, version_id) is None:
+    with read_snapshot(conn):
+        records = service.query_records(conn, ship_no, "pending", version_id)
+    if records is None:
         raise HTTPException(status_code=404, detail="结果版本不存在")
-    return service.query_records(conn, ship_no, "pending", version_id)
+    return records
 
 
 @app.get("/versions", response_model=list[VersionInfo])
